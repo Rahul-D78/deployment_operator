@@ -1,0 +1,24 @@
+# permissions for end users to edit automations.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: automation-editor-role
+rules:
+- apiGroups:
+  - demo.my.domain
+  resources:
+  - automations
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - demo.my.domain
+  resources:
+  - automations/status
+  verbs:
+  - get

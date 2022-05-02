@@ -1,0 +1,7 @@
+apiVersion: demo.my.domain/v1alpha1
+kind: Automation
+metadata:
+  name: automation-sample
+spec:
+  size: 1
+  title: "hwllo"
