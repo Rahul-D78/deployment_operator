@@ -3,44 +3,51 @@ package controllers
 import (
 	"context"
 	automation "demo/api/v1alpha1"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-func backendDeploymentName(auto *automation.Automation) string {
-	return auto.Name + "-backend"
+const backendPort = 8000
+const backendServicePort = 30685
+const backendImage = "jdob/visitors-service:1.0.0"
+
+func backendDeploymentName(v *automation.Automation) string {
+	return v.Name + "-backend"
 }
 
-func (r *AutomationReconciler) backendDeployment(auto *automation.Automation) *appsv1.Deployment {
-	labels := labels(auto, "backend")
-	size := auto.Spec.Size
-	var ContainerPort int32 = 12
-	var backendImage string = "demo:image"
+func backendServiceName(v *automation.Automation) string {
+	return v.Name + "-backend-service"
+}
+
+func (r *AutomationReconciler) backendDeployment(v *automation.Automation) *appsv1.Deployment {
+	labels := labels(v, "backend")
+	size := v.Spec.Size
 
 	userSecret := &corev1.EnvVarSource{
 		SecretKeyRef: &corev1.SecretKeySelector{
-			LocalObjectReference: corev1.LocalObjectReference{Name: mysqlAuthName},
+			LocalObjectReference: corev1.LocalObjectReference{Name: mysqlAuthName()},
 			Key:                  "username",
 		},
 	}
 
 	passwordSecret := &corev1.EnvVarSource{
 		SecretKeyRef: &corev1.SecretKeySelector{
-			LocalObjectReference: corev1.LocalObjectReference{Name: mysqlAuthName},
+			LocalObjectReference: corev1.LocalObjectReference{Name: mysqlAuthName()},
 			Key:                  "password",
 		},
 	}
 
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "depl",
-			Namespace: auto.Namespace,
+			Name:      backendDeploymentName(v),
+			Namespace: v.Namespace,
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &size,
@@ -57,7 +64,7 @@ func (r *AutomationReconciler) backendDeployment(auto *automation.Automation) *a
 						ImagePullPolicy: corev1.PullAlways,
 						Name:            "visitors-service",
 						Ports: []corev1.ContainerPort{{
-							ContainerPort: ContainerPort,
+							ContainerPort: backendPort,
 							Name:          "visitors",
 						}},
 						Env: []corev1.EnvVar{
@@ -67,7 +74,7 @@ func (r *AutomationReconciler) backendDeployment(auto *automation.Automation) *a
 							},
 							{
 								Name:  "MYSQL_SERVICE_HOST",
-								Value: mysqlServiceName,
+								Value: mysqlServiceName(),
 							},
 							{
 								Name:      "MYSQL_USERNAME",
@@ -84,22 +91,63 @@ func (r *AutomationReconciler) backendDeployment(auto *automation.Automation) *a
 		},
 	}
 
-	controllerutil.SetControllerReference(auto, dep, r.Scheme)
+	controllerutil.SetControllerReference(v, dep, r.Scheme)
 	return dep
 }
 
-func (r *AutomationReconciler) handleBackendChanges(auto *automation.Automation) (*reconcile.Result, error) {
+func (r *AutomationReconciler) backendService(v *automation.Automation) *corev1.Service {
+	labels := labels(v, "backend")
 
-	foundDepl := &appsv1.Deployment{}
-	deplKey := types.NamespacedName{Name: backendDeploymentName(auto), Namespace: auto.Namespace}
-
-	err := r.Client.Get(context.TODO(), deplKey, foundDepl)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			r.Log.Error(err, "Not found may be object got deleted requeing")
-			return &reconcile.Result{Requeue: true}, err
-		}
+	s := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      backendServiceName(v),
+			Namespace: v.Namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: labels,
+			Ports: []corev1.ServicePort{{
+				Protocol:   corev1.ProtocolTCP,
+				Port:       backendPort,
+				TargetPort: intstr.FromInt(backendPort),
+				NodePort:   30685,
+			}},
+			Type: corev1.ServiceTypeNodePort,
+		},
 	}
 
-	return &reconcile.Result{}, err
+	controllerutil.SetControllerReference(v, s, r.Scheme)
+	return s
+}
+
+func (r *AutomationReconciler) updateBackendStatus(v *automation.Automation) error {
+	v.Status.BackendImage = backendImage
+	err := r.Status().Update(context.TODO(), v)
+	return err
+}
+
+func (r *AutomationReconciler) handleBackendChanges(v *automation.Automation) (*reconcile.Result, error) {
+	found := &appsv1.Deployment{}
+	err := r.Get(context.TODO(), types.NamespacedName{
+		Name:      backendDeploymentName(v),
+		Namespace: v.Namespace,
+	}, found)
+	if err != nil {
+		// The deployment may not have been created yet, so requeue
+		return &reconcile.Result{RequeueAfter: 5 * time.Second}, err
+	}
+
+	size := v.Spec.Size
+
+	if size != *found.Spec.Replicas {
+		found.Spec.Replicas = &size
+		err = r.Update(context.TODO(), found)
+		if err != nil {
+			r.Log.Error(err, "Failed to update Deployment.", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
+			return &reconcile.Result{}, err
+		}
+		// Spec updated - return and requeue
+		return &reconcile.Result{Requeue: true}, nil
+	}
+
+	return nil, nil
 }

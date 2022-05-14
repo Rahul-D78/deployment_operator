@@ -18,8 +18,11 @@ package controllers
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -52,9 +55,92 @@ func (r *AutomationReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	log.Info("Initiating automation reconciler")
 
 	auto := &demov1alpha1.Automation{}
+	err := r.Get(context.TODO(), req.NamespacedName, auto)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			//request object not found could have been deleted or modified
+			return ctrl.Result{}, nil
+		}
+		//Error reading the object
+		return ctrl.Result{}, nil
+	}
 
-	r.deployMySql(auto)
-	r.backendDeployment(auto)
+	var result *ctrl.Result
+	var request ctrl.Request
+
+	// == MySQL ==========
+	result, err = r.ensureSecret(request, auto, r.mysqlAuthSecret(auto))
+	if result != nil {
+		return *result, err
+	}
+
+	result, err = r.ensureDeployment(request, auto, r.mysqlDeployment(auto))
+	if result != nil {
+		return *result, err
+	}
+
+	result, err = r.ensureService(request, auto, r.mysqlService(auto))
+	if result != nil {
+		return *result, err
+	}
+
+	mysqlRunning := r.isMysqlUp(auto)
+
+	if !mysqlRunning {
+		// If MySQL isn't running yet, requeue the reconcile
+		// to run again after a delay
+		delay := time.Second * time.Duration(5)
+
+		log.Info(fmt.Sprintf("MySQL isn't running, waiting for %s", delay))
+		return ctrl.Result{RequeueAfter: delay}, nil
+	}
+
+	// == autoisitors Backend  ==========
+	result, err = r.ensureDeployment(request, auto, r.backendDeployment(auto))
+	if result != nil {
+		return *result, err
+	}
+
+	result, err = r.ensureService(request, auto, r.backendService(auto))
+	if result != nil {
+		return *result, err
+	}
+
+	err = r.updateBackendStatus(auto)
+	if err != nil {
+		// Requeue the request if the status could not be updated
+		return ctrl.Result{}, err
+	}
+
+	result, err = r.handleBackendChanges(auto)
+	if result != nil {
+		return *result, err
+	}
+
+	// == autoisitors Frontend ==========
+	result, err = r.ensureDeployment(request, auto, r.frontendDeployment(auto))
+	if result != nil {
+		return *result, err
+	}
+
+	result, err = r.ensureService(request, auto, r.frontendService(auto))
+	if result != nil {
+		return *result, err
+	}
+
+	err = r.updateFrontendStatus(auto)
+	if err != nil {
+		// Requeue the request
+		return ctrl.Result{}, err
+	}
+
+	result, err = r.handleFrontendChanges(auto)
+	if result != nil {
+		return *result, err
+	}
+
+	// == Finish ==========
+	// Eautoerything went fine, don't requeue
 	return ctrl.Result{}, nil
 }
 
